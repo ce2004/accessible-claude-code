@@ -1,27 +1,43 @@
 @echo off
 setlocal
 rem Claude Accessibility: sets up Claude Code for screen reader users on this Windows account.
-rem It turns on screen reader settings, installs the quiet-tools mod, and silences the
-rem Windows Terminal bell. Safe to run again at any time.
+rem It turns on screen reader settings, installs the quiet-tools mod, silences the
+rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. Safe to run again at any time.
+rem When it starts, it checks GitHub for a newer version, and if there is one it
+rem replaces this file with it and runs it instead.
+rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
+set "CA_VERSION=1.1.0"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if exist "%CA_PS%" goto run
-set "CA_PS="
+if not exist "%CA_PS%" set "CA_PS="
 for %%P in (powershell.exe pwsh.exe) do if not defined CA_PS for %%Q in (%%P) do if not "%%~$PATH:Q"=="" set "CA_PS=%%~$PATH:Q"
-if defined CA_PS goto run
-echo PowerShell was not found on this PC, so nothing was changed.
-echo Windows normally includes it. Ask whoever manages this PC to turn it back on.
-goto end
-:run
-"%CA_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "try { $t=[IO.File]::ReadAllText($env:CA_SELF); $i=$t.IndexOf('#'+'PSSTART'); if ($i -lt 0) { throw 'This file is damaged. Download it again.' }; iex $t.Substring($i) } catch { Write-Host ''; Write-Host ('Something unexpected went wrong: ' + $_.Exception.Message); exit 9 }"
-if errorlevel 9 (
+if not defined CA_PS (
+  echo PowerShell was not found on this PC, so nothing was changed.
+  echo Windows normally includes it. Ask whoever manages this PC to turn it back on.
   echo.
-  echo The setup stopped partway. The steps reported above were done. You can run this file again.
+  pause
+  exit /b
 )
-:end
-echo.
-pause
-exit /b
+rem This block is read in one go, so it keeps working after the update rewrites this file.
+rem Exit code 10: this file was updated. 11: the update was saved to the temp folder instead.
+(
+  "%CA_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "try { $t=[IO.File]::ReadAllText($env:CA_SELF); $i=$t.IndexOf('#'+'PSSTART'); if ($i -lt 0) { throw 'This file is damaged. Download it again.' }; iex $t.Substring($i) } catch { Write-Host ''; Write-Host ('Something unexpected went wrong: ' + $_.Exception.Message); exit 9 }"
+  if errorlevel 11 (
+    set "CA_UPDATED=1"
+    call "%TEMP%\claude-accessibility-update.cmd"
+    exit /b
+  ) else if errorlevel 10 (
+    set "CA_UPDATED=1"
+    call "%CA_SELF%"
+    exit /b
+  ) else if errorlevel 9 (
+    echo.
+    echo The setup stopped partway. The steps reported above were done. You can run this file again.
+  )
+  echo.
+  pause
+  exit /b
+)
 
 #PSSTART
 $ErrorActionPreference = 'Stop'
@@ -95,6 +111,61 @@ function Invoke-Tool([string]$exe, [string[]]$argList, [int]$seconds = 120) {
     $proc.WaitForExit()
     $text = ($outTask.Result + "`n" + $errTask.Result) -replace '\x1b\[[0-9;?]*[A-Za-z]', ''
     return @{ Code = $proc.ExitCode; Out = $text.Trim(); TimedOut = $false }
+}
+
+# ---------------------------------------------------------------- Update check
+# If GitHub has a newer version, it replaces this file and exits with code 10, so
+# the batch part above starts the new copy. If this file cannot be replaced, the new
+# copy goes to the temp folder instead (code 11). A copy just updated skips the check.
+$updateUrl = 'https://raw.githubusercontent.com/ce2004/accessible-claude-code/main/claude-accessibility.cmd'
+if (-not $env:CA_UPDATED -and $env:CA_SELF) {
+    $newCopy = $null
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 } catch {}
+        $req = [Net.WebRequest]::Create($updateUrl)
+        $req.Timeout = 10000
+        if ($req -is [Net.HttpWebRequest]) {
+            $req.ReadWriteTimeout = 10000
+            $req.UserAgent = 'claude-accessibility-updater'
+            $req.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+        }
+        $resp = $req.GetResponse()
+        try {
+            $ms = New-Object IO.MemoryStream
+            $resp.GetResponseStream().CopyTo($ms)
+            $bytes = $ms.ToArray()
+        } finally { $resp.Close() }
+        $text = $enc.GetString($bytes)
+        $m = [regex]::Match($text, '(?m)^set "CA_VERSION=([0-9]+(\.[0-9]+){1,3})"')
+        if ($m.Success -and $text.StartsWith('@echo off') -and $text.Contains('#' + 'PSSTART') -and
+            ([version]$m.Groups[1].Value -gt [version]$env:CA_VERSION)) {
+            $newCopy = $bytes
+            Say ('A newer version of this setup is out (' + $m.Groups[1].Value + '). Updating and starting it again.')
+        }
+    } catch {
+        Say 'Could not check for a newer version, so this one will run.'
+        Say ''
+    }
+    if ($newCopy) {
+        $tmp = $env:CA_SELF + '.new-claude-accessibility'
+        try {
+            [IO.File]::WriteAllBytes($tmp, $newCopy)
+            [IO.File]::Replace($tmp, $env:CA_SELF, [NullString]::Value)
+            Say ''
+            exit 10
+        } catch {
+            Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            [IO.File]::WriteAllBytes((Join-Path $env:TEMP 'claude-accessibility-update.cmd'), $newCopy)
+            Say 'This file could not be replaced, so the new version runs from the temp folder.'
+            Say ''
+            exit 11
+        } catch {
+            Say ('The update could not be saved, so this version will run: ' + $_.Exception.Message)
+            Say ''
+        }
+    }
 }
 
 # ---------------------------------------------------------------- Checks
@@ -677,6 +748,129 @@ if (-not $wtFound) {
     Say 'If you hear a bell after each reply, install Windows Terminal from the Microsoft Store and run this again.'
 }
 
+# ---------------------------------------------------------------- Part 4: the Console Redraw Fix add-on for NVDA
+# Claude Code sometimes wipes the console and draws it again, and NVDA then reads
+# the whole screen from the top. This add-on stops that. It is downloaded from
+# GitHub each time, and installed or updated when GitHub has a newer version.
+# If the person removed it from NVDA, it is not put back.
+Say ''
+$nvdaRestart = $null
+$addonName = 'consoleRedrawFix'
+$addonBase = 'https://raw.githubusercontent.com/ce2004/accessible-claude-code/main/console-redraw-fix/'
+$addonFiles = @('manifest.ini', 'globalPlugins/consoleRedrawFix.py')
+$nvdaConfig = Join-Path $env:APPDATA 'nvda'
+$addonDir = Join-Path $nvdaConfig "addons\$addonName"
+$addonMark = Join-Path $dir 'claude-accessibility\nvda-addon-installed.txt'
+
+function Get-Download([string]$url) {
+    $req = [Net.WebRequest]::Create($url)
+    $req.Timeout = 15000
+    if ($req -is [Net.HttpWebRequest]) {
+        $req.ReadWriteTimeout = 15000
+        $req.UserAgent = 'claude-accessibility-updater'
+        $req.CachePolicy = New-Object Net.Cache.RequestCachePolicy([Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+    }
+    $resp = $req.GetResponse()
+    try {
+        $ms = New-Object IO.MemoryStream
+        $resp.GetResponseStream().CopyTo($ms)
+        return , $ms.ToArray()
+    } finally { $resp.Close() }
+}
+# Reads one value, such as version, from an add-on manifest.
+function Get-ManifestValue([string]$text, [string]$key) {
+    $m = [regex]::Match($text, '(?m)^\s*' + $key + '\s*=\s*"?([^"\r\n]*?)"?\s*$')
+    if ($m.Success) { return $m.Groups[1].Value } else { return $null }
+}
+function ConvertTo-Version([string]$v) {
+    $m = [regex]::Match([string]$v, '^\s*(\d+)(\.\d+)?(\.\d+)?')
+    if (-not $m.Success) { return $null }
+    $parts = @($m.Groups[1].Value, ($m.Groups[2].Value.TrimStart('.')), ($m.Groups[3].Value.TrimStart('.'))) | ForEach-Object { if ($_) { $_ } else { '0' } }
+    return [version]($parts -join '.')
+}
+
+try {
+    # The NVDA that is running, or else the installed one.
+    $nvdaExe = $null
+    try { $nvdaExe = (Get-Process -Name nvda -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path } catch {}
+    if (-not $nvdaExe) {
+        foreach ($key in @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\NVDA', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\NVDA')) {
+            try {
+                $u = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).UninstallDirectory
+                if ($u -and (Test-Path -LiteralPath (Join-Path $u 'nvda.exe'))) { $nvdaExe = Join-Path $u 'nvda.exe'; break }
+            } catch {}
+        }
+    }
+    $nvdaRunning = [bool](Get-Process -Name nvda -ErrorAction SilentlyContinue)
+    $installedText = if (Test-Path -LiteralPath "$addonDir\manifest.ini") { Read-Text "$addonDir\manifest.ini" } else { $null }
+
+    if (-not $nvdaExe -and -not (Test-Path -LiteralPath $nvdaConfig)) {
+        Say 'NVDA is not installed, so the Console Redraw Fix add-on was skipped. It is only for NVDA.'
+    } elseif (-not $installedText -and (Test-Path -LiteralPath $addonMark)) {
+        Say 'The Console Redraw Fix add-on was removed from NVDA earlier, so it was not put back.'
+        Say 'To get it back, see How to undo it in the readme.'
+    } else {
+        # Download it into a temporary folder and check it before touching NVDA.
+        $stage = Join-Path ([IO.Path]::GetTempPath()) ('claude-accessibility-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            foreach ($f in $addonFiles) {
+                $target = Join-Path $stage ($f -replace '/', '\')
+                $parent = Split-Path $target
+                if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+                try { $data = Get-Download ($addonBase + $f) }
+                catch { throw 'it could not be downloaded from GitHub. Check that you are online, then run this again.' }
+                [IO.File]::WriteAllBytes($target, $data)
+            }
+            $newText = Read-Text "$stage\manifest.ini"
+            if ((Get-ManifestValue $newText 'name') -ne $addonName) { throw 'the downloaded add-on did not look right' }
+            $newVersion = ConvertTo-Version (Get-ManifestValue $newText 'version')
+            $minNvda = ConvertTo-Version (Get-ManifestValue $newText 'minimumNVDAVersion')
+            $oldVersion = if ($installedText) { ConvertTo-Version (Get-ManifestValue $installedText 'version') } else { $null }
+            $nvdaVersion = $null
+            if ($nvdaExe) { try { $nvdaVersion = ConvertTo-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($nvdaExe).ProductVersion) } catch {} }
+
+            if (-not $newVersion) {
+                throw 'the downloaded add-on has no version number'
+            } elseif ($oldVersion -and $oldVersion -ge $newVersion) {
+                Say ('The Console Redraw Fix add-on for NVDA is already up to date (version ' + $oldVersion + ').')
+            } elseif ($nvdaVersion -and $minNvda -and $nvdaVersion -lt $minNvda) {
+                Say ('The Console Redraw Fix add-on needs NVDA ' + $minNvda + ' or newer, and this PC has NVDA ' + $nvdaVersion + ', so it was skipped.')
+                Say 'Update NVDA, then run this again.'
+                $failed++
+            } else {
+                # Swap the folders, keeping the old one until the new one is in place.
+                $addonsRoot = Split-Path $addonDir
+                if (-not (Test-Path -LiteralPath $addonsRoot)) { New-Item -ItemType Directory -Path $addonsRoot -Force | Out-Null }
+                $old = $addonDir + '.old-claude-accessibility'
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+                if (Test-Path -LiteralPath $addonDir) { Move-Item -LiteralPath $addonDir -Destination $old }
+                try {
+                    Copy-Item -LiteralPath $stage -Destination $addonDir -Recurse
+                } catch {
+                    if (Test-Path -LiteralPath $addonDir) { Remove-Item -LiteralPath $addonDir -Recurse -Force -ErrorAction SilentlyContinue }
+                    if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old -Destination $addonDir }
+                    throw
+                }
+                if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+                if ($oldVersion) { Say ('The Console Redraw Fix add-on for NVDA was updated to version ' + $newVersion + '.') }
+                else { Say 'The Console Redraw Fix add-on for NVDA was installed. NVDA now reads only new lines when Claude Code redraws the screen.' }
+                $nvdaRestart = 'to load the Console Redraw Fix add-on'
+            }
+        } finally {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # Remember that it was installed, so removing it in NVDA is respected later.
+    if (Test-Path -LiteralPath "$addonDir\manifest.ini") {
+        $markDir = Split-Path $addonMark
+        if (-not (Test-Path -LiteralPath $markDir)) { New-Item -ItemType Directory -Path $markDir -Force | Out-Null }
+        [IO.File]::WriteAllText($addonMark, "The Console Redraw Fix add-on was installed in NVDA. Delete this file to have it put back.`r`n", $enc)
+    }
+} catch {
+    Say ('The Console Redraw Fix add-on could not be set up: ' + $_.Exception.Message)
+    $failed++
+}
+
 # ---------------------------------------------------------------- Finish
 Say ''
 if ($failed -eq 0) {
@@ -684,5 +878,25 @@ if ($failed -eq 0) {
 } else {
     Say ('Finished, but ' + $failed + ' step(s) need attention; see the messages above.')
     Say 'Everything else was set up. If Claude Code is open, close it and start it again.'
-    exit 2
 }
+if ($nvdaRestart) {
+    Say ''
+    if (-not $nvdaRunning -or -not $nvdaExe) {
+        Say ('Restart NVDA ' + $nvdaRestart + '.')
+    } else {
+        Say ('NVDA needs to restart ' + $nvdaRestart + '. Press R to restart it now, or any other key to restart it yourself later.')
+        $key = $null
+        try { $key = [Console]::ReadKey($true) } catch {}
+        if ($key -and $key.Key -eq [ConsoleKey]::R) {
+            try {
+                Start-Process -FilePath $nvdaExe -ArgumentList '-r'
+                Say 'NVDA is restarting.'
+            } catch {
+                Say ('NVDA could not be restarted: ' + $_.Exception.Message + ' Restart it yourself.')
+            }
+        } else {
+            Say 'Restart NVDA when you are ready.'
+        }
+    }
+}
+if ($failed -gt 0) { exit 2 }

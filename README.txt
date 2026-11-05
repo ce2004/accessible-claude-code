@@ -1,6 +1,6 @@
-Claude Accessibility
+Accessible Claude Code
 
-One file that sets up Claude Code on Windows for blind and low vision people who use a screen reader such as NVDA or JAWS. Run it once and restart Claude Code.
+One file, claude-accessibility.cmd, that sets up Claude Code on Windows for blind and low vision people who use a screen reader such as NVDA or JAWS. Run it once and restart Claude Code.
 
 What it does
 
@@ -18,22 +18,25 @@ Adds a few extra words to the working line, like Faering and Paering.
 
 It turns off the bell that Windows Terminal plays at the end of every reply.
 
+If you use NVDA, it installs the Console Redraw Fix add-on. Claude Code sometimes wipes the screen and draws everything again. Without the add-on, NVDA then reads the whole screen from the top, and your review cursor ends up at the top. With it, NVDA speaks only the lines you have not heard yet, and puts the review cursor on the last line of text. It only works in terminal windows, meaning Windows Terminal and the classic console that cmd and PowerShell open in. Normal new output is read just like before. A change only counts as a redraw when it is at least 3 lines and at least half of them were already on screen. In Windows Terminal, NVDA must read new text by diffing, which is NVDA's default. It is under NVDA settings, Advanced, "Speak new text in Windows Terminal via".
+
 You need
 
 Windows 10 or 11, on an ARM, Intel or AMD PC.
 Claude Code, already installed and signed in.
+For the add-on: NVDA 2024.1 or newer, installed on the PC (not a portable copy).
 
 How to install
 
 The easiest way: press Windows+R, paste this line, and press Enter.
 
-powershell -nop -ep bypass -c "[Net.ServicePointManager]::SecurityProtocol=3072;$f=Join-Path $env:TEMP ca.cmd;irm https://raw.githubusercontent.com/ce2004/claude-accessibility/main/claude-accessibility.cmd -OutFile $f;& $f"
+powershell -nop -ep bypass -c "[Net.ServicePointManager]::SecurityProtocol=3072;$f=Join-Path $env:TEMP ca.cmd;irm https://raw.githubusercontent.com/ce2004/accessible-claude-code/main/claude-accessibility.cmd -OutFile $f;& $f"
 
 Or download claude-accessibility.cmd from this page and double-click it. Windows may say "Windows protected your PC". Choose More info, then Run anyway.
 
-When it finishes, it reads out what it did. Close Claude Code and start it again.
+When it finishes, it reads out what it did. Close Claude Code and start it again. If it installed or updated the NVDA add-on, it asks you to press R to restart NVDA, or any other key to restart NVDA yourself later.
 
-It is safe to run again at any time, for example to get a newer version. If one step fails, it says why and still does the rest.
+It is safe to run again at any time. Each time it starts, it checks this page for a newer version. If there is one, it updates itself and starts again, so you always get the latest setup. It also checks for a newer version of the NVDA add-on, and updates it. If it cannot check, for example when you are offline, it runs the version you have. If one step fails, it says why and still does the rest.
 
 Good to know
 
@@ -46,4 +49,10 @@ How to undo it
 The mod: in a terminal, run: claude plugin uninstall quiet-tools@claude-accessibility
 Then delete the claude-accessibility folder inside the .claude folder in your user folder.
 
+The NVDA add-on: in NVDA, open Tools, then Add-on store, go to the Installed add-ons tab, choose Console Redraw Fix, and remove it. Then restart NVDA. The setup will not put it back. To get it back later, delete the file nvda-addon-installed.txt in the claude-accessibility folder inside the .claude folder in your user folder, then run the setup again.
+
 The settings: before the first change, the script saves a copy of each settings file next to it, ending in .before-claude-accessibility. To go back, delete the changed file and remove that ending from the copy's name. The Claude Code settings are in the .claude folder in your user folder. The Windows Terminal settings can also be changed in Windows Terminal under Settings, then Defaults, then Advanced, then Bell notification style.
+
+For developers
+
+The add-on source is in the console-redraw-fix folder. The setup downloads it from there, file by file. When you change the add-on, raise version in its manifest.ini, or the setup will not update it. When you change claude-accessibility.cmd, raise CA_VERSION near its top, or copies people already have will not update themselves. To make an add-on file to open by hand, zip the contents of the console-redraw-fix folder (not the folder itself) and rename the zip to end in .nvda-addon.
