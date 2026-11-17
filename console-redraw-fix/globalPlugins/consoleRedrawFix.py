@@ -4,16 +4,33 @@
 # and the review cursor lands at the top.
 # This add-on spots those redraws in terminal windows (Windows Terminal and the classic console),
 # speaks only lines you have not heard yet, and puts the review cursor on the last line of text.
+#
+# It also adds Find for Claude Code conversations. The terminal only keeps the last screen or so,
+# so Control+F in a Claude Code window asks for text, then opens the whole conversation
+# as a document in browse mode, with the cursor on the most recent place the text appears.
+# The arrow keys read on from there. F3 and Shift+F3 go to the next and previous match.
+# It finds the conversation through small files the quiet-tools mod writes, one per session,
+# naming the window title and the conversation's transcript file.
 
+import html
+import inspect
+import json
+import os
+import threading
+import time
 from collections import OrderedDict
 
 import api
 import core
 import globalPluginHandler
+import gui
 import queueHandler
 import textInfos
+import ui
+import wx
 from logHandler import log
 from NVDAObjects.behaviors import LiveText
+from scriptHandler import script
 
 # How many recently seen lines to remember.
 _MAX_SEEN = 4000
@@ -29,9 +46,134 @@ _REVIEW_DELAY_MS = 300
 # NVDA's own classes for terminal text areas that read new text by diffing.
 _TERMINAL_CLASSES = frozenset(("WinConsoleUIA", "_DiffBasedWinTerminalUIA", "WinConsole"))
 
+_CATEGORY = "Console Redraw Fix"
+# Text typed into the find box, offered again next time.
+_lastFind = ""
+# Window files older than this are from sessions long gone, and are deleted.
+_WINDOW_FILE_MAX_AGE = 30 * 86400
+
 
 def _norm(line: str) -> str:
 	return " ".join(line.split())
+
+
+# ---------------------------------------------------------------- Claude Code conversations
+
+
+def _configDir() -> str:
+	return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def _windowFiles() -> list[dict]:
+	folder = os.path.join(_configDir(), "claude-accessibility", "windows")
+	found = []
+	try:
+		names = os.listdir(folder)
+	except OSError:
+		return found
+	now = time.time()
+	for name in names:
+		path = os.path.join(folder, name)
+		try:
+			if now - os.path.getmtime(path) > _WINDOW_FILE_MAX_AGE:
+				os.remove(path)
+				continue
+			with open(path, encoding="utf-8") as f:
+				entry = json.load(f)
+			if isinstance(entry, dict) and entry.get("transcript"):
+				entry["mtime"] = os.path.getmtime(path)
+				found.append(entry)
+		except Exception:
+			continue
+	return sorted(found, key=lambda e: e["mtime"], reverse=True)
+
+
+def _findConversation(windowTitle: str):
+	"""The window file of the Claude Code session drawn in a window with this title, or None."""
+	entries = [e for e in _windowFiles() if os.path.isfile(e["transcript"])]
+	for entry in entries:
+		if entry.get("title") == windowTitle:
+			return entry
+	# The title can change between the mod writing it and Windows showing it.
+	if "Claude" in (windowTitle or "") and entries:
+		return entries[0]
+	return None
+
+
+def _messageText(content) -> str:
+	if isinstance(content, str):
+		return content
+	if not isinstance(content, list):
+		return ""
+	return "\n".join(
+		b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+	)
+
+
+def _readConversation(path: str) -> list[tuple[str, str]]:
+	"""The conversation as (who, text) pairs, Claude's replies in one turn joined together."""
+	messages: list[tuple[str, str]] = []
+	with open(path, encoding="utf-8", errors="replace") as f:
+		for line in f:
+			head = line[:400]
+			if '"isSidechain":false' not in head:
+				continue
+			isUser = '"type":"user"' in head
+			if not isUser and '"role":"assistant"' not in line:
+				continue
+			try:
+				entry = json.loads(line)
+			except ValueError:
+				continue
+			kind = entry.get("type")
+			message = entry.get("message") or {}
+			if kind == "user" and not entry.get("isMeta"):
+				text = _messageText(message.get("content")).strip()
+				if text and not text.startswith("<"):
+					messages.append(("You", text))
+			elif kind == "assistant":
+				text = _messageText(message.get("content")).strip()
+				if not text:
+					continue
+				if messages and messages[-1][0] == "Claude":
+					messages[-1] = ("Claude", messages[-1][1] + "\n\n" + text)
+				else:
+					messages.append(("Claude", text))
+	return messages
+
+
+def _conversationHtml(title: str, messages: list[tuple[str, str]], matches: int, query: str) -> str:
+	# The query is left out of the opening line, so a search backwards from the end
+	# never lands on it.
+	parts = [f"<h1>{html.escape(title)}</h1>"]
+	parts.append(
+		f"<p>{matches} {'message' if matches == 1 else 'messages'} matched. You are on the most recent match. "
+		"Press Shift+F3 for the one before, F3 for the one after, Escape to close.</p>"
+	)
+	for who, text in messages:
+		parts.append(f"<h2>{who}</h2>")
+		for para in text.split("\n\n"):
+			para = para.strip("\n")
+			if para.strip():
+				parts.append("<p>" + html.escape(para).replace("\n", "<br>") + "</p>")
+	return "\n".join(parts)
+
+
+def _showDocument(htmlText: str, title: str):
+	kwargs = {"isHtml": True}
+	try:
+		params = inspect.signature(ui.browseableMessage).parameters
+		if "sanitizeHtmlFunc" in params:
+			# Everything from the transcript is escaped above.
+			kwargs["sanitizeHtmlFunc"] = lambda text: text
+		if "closeButton" in params:
+			kwargs["closeButton"] = True
+	except Exception:
+		pass
+	ui.browseableMessage(htmlText, title, **kwargs)
+
+
+# ---------------------------------------------------------------- The terminal overlay
 
 
 class ConsoleRedrawFix(LiveText):
@@ -126,6 +268,95 @@ class ConsoleRedrawFix(LiveText):
 			info.expand(textInfos.UNIT_LINE)
 		info.collapse()
 		return info
+
+	# ---------------------------------------------------------------- Find
+
+	@script(
+		description="In a Claude Code window, finds text in the conversation and opens it there to read",
+		gestures=["kb:control+f", "kb:NVDA+control+f"],
+		category=_CATEGORY,
+	)
+	def script_crfFind(self, gesture):
+		windowTitle = api.getForegroundObject().name or ""
+		conversation = _findConversation(windowTitle)
+		if conversation is None:
+			# Not a Claude Code window: the program gets the key as usual.
+			gesture.send()
+			return
+		wx.CallAfter(self._crfAskFind, conversation)
+
+	def _crfAskFind(self, conversation: dict):
+		global _lastFind
+		text = ""
+		isOk = False
+		gui.mainFrame.prePopup()
+		try:
+			dialog = wx.TextEntryDialog(
+				gui.mainFrame, "Text to find in this conversation:", "Find in conversation", _lastFind
+			)
+			isOk = dialog.ShowModal() == wx.ID_OK
+			text = dialog.GetValue().strip()
+			dialog.Destroy()
+		except Exception:
+			log.exception("Console Redraw Fix: the find box failed")
+		finally:
+			gui.mainFrame.postPopup()
+		if not (isOk and text):
+			return
+		_lastFind = text
+		ui.message("Searching")
+		threading.Thread(
+			target=self._crfSearch, args=(conversation, text), daemon=True, name="consoleRedrawFixFind"
+		).start()
+
+	def _crfSearch(self, conversation: dict, text: str):
+		# Runs on its own thread, since a long conversation takes a moment to read.
+		try:
+			messages = _readConversation(conversation["transcript"])
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't read the conversation")
+			queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "The conversation could not be read")
+			return
+		needle = text.lower()
+		matches = sum(1 for _, body in messages if needle in body.lower())
+		if not matches:
+			queueHandler.queueFunction(
+				queueHandler.eventQueue, ui.message, f"{text} is not in this conversation"
+			)
+			return
+		convTitle = conversation.get("name") or "Claude Code conversation"
+		page = _conversationHtml(convTitle, messages, matches, text)
+		wx.CallAfter(self._crfOpen, page, f"{convTitle} - find {text}", text)
+
+	def _crfOpen(self, page: str, title: str, text: str):
+		try:
+			_showDocument(page, title)
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't open the conversation")
+			ui.message("The conversation could not be opened")
+			return
+		self._crfLandTries = 0
+		core.callLater(400, self._crfLand, text)
+
+	def _crfLand(self, text: str):
+		# Wait for the document to load in browse mode, then find the last match from the end.
+		self._crfLandTries += 1
+		try:
+			ti = api.getFocusObject().treeInterceptor
+			if ti is None or not getattr(ti, "isReady", False) or not hasattr(ti, "doFindText"):
+				if self._crfLandTries < 40:
+					core.callLater(250, self._crfLand, text)
+				return
+			try:
+				import cursorManager
+				cursorManager.CursorManager._lastFindText = text
+			except Exception:
+				pass
+			ti._lastFindText = text
+			ti.selection = ti.makeTextInfo(textInfos.POSITION_LAST)
+			ti.doFindText(text, reverse=True)
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't move to the match")
 
 
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):

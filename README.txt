@@ -12,13 +12,16 @@ Hides the hint line under the prompt.
 Replaces the "Churned for 3 seconds" line with "Done.", or "Done. Still working in the background." when something is still running.
 Plays a soft chord when Claude finishes a reply.
 Plays a different chord when Claude asks you a question or needs your permission, and repeats it every 6 seconds until you answer.
-Sets the window title to what Claude is doing, such as Claude is working, Claude is done, or Claude needs your permission. With NVDA, press NVDA+T to hear it.
+Sets the window title to the conversation's name and what Claude is doing, such as "Fix the login page - Claude is working", "Claude is done", or "Claude needs your permission". With NVDA, press NVDA+T to hear it. A new conversation gets a short name from what you first asked, made again after your 4th message as the topic settles, and saved so it shows when you resume. A name you give it with /rename, or one Claude Code gives it, is used instead and never replaced.
+Makes /resume readable. Type /resume to hear your 15 newest conversations as a numbered list, with when and where each one was. Type /resume and some words, such as /resume login page, to list the conversations that mention all of those words, each with the text around the match. Then type /resume and a number, such as /resume 2, to open that one.
 Tells Claude to write for a screen reader: answer first, and no tables, diagrams or emoji.
 Adds a few extra words to the working line, like Faering and Paering.
 
 It turns off the bell that Windows Terminal plays at the end of every reply.
 
 If you use NVDA, it installs the Console Redraw Fix add-on. Claude Code sometimes wipes the screen and draws everything again. Without the add-on, NVDA then reads the whole screen from the top, and your review cursor ends up at the top. With it, NVDA speaks only the lines you have not heard yet, and puts the review cursor on the last line of text. It only works in terminal windows, meaning Windows Terminal and the classic console that cmd and PowerShell open in. Normal new output is read just like before. A change only counts as a redraw when it is at least 3 lines and at least half of them were already on screen. In Windows Terminal, NVDA must read new text by diffing, which is NVDA's default. It is under NVDA settings, Advanced, "Speak new text in Windows Terminal via".
+
+The add-on also adds Find for Claude Code conversations. The terminal only keeps about the last screen of text, so it searches the saved conversation instead. In a Claude Code window, press Control+F (or NVDA+Control+F), type what to find, and press Enter. NVDA opens the whole conversation as a document in browse mode, with a heading for each of your messages and each of Claude's replies, and puts you on the most recent place the text appears. Read on with the arrow keys. Shift+F3 goes to the match before, F3 to the one after, and Escape closes it. In other terminal windows Control+F works as usual. You can change these keys in NVDA's Input gestures, under Console Redraw Fix.
 
 You need
 

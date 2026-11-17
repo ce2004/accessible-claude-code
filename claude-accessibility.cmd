@@ -6,7 +6,7 @@ rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. 
 rem When it starts, it checks GitHub for a newer version, and if there is one it
 rem replaces this file with it and runs it instead.
 rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
-set "CA_VERSION=1.1.0"
+set "CA_VERSION=1.2.0"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%CA_PS%" set "CA_PS="
@@ -308,7 +308,7 @@ if (-not $claude) {
 { "name": "claude-accessibility", "owner": { "name": "Claude Accessibility" }, "plugins": [ { "name": "quiet-tools", "source": "./plugins/quiet-tools", "description": "Hides tool call lines for screen reader users." } ] }
 '@
         $files["$mod\.claude-plugin\plugin.json"] = @'
-{ "name": "quiet-tools", "version": "0.1.0", "description": "Hides tool call lines in the transcript, except tools that ask you a question. Ctrl+O still shows everything." }
+{ "name": "quiet-tools", "version": "0.2.0", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
 '@
         $files["$mod\hooks\hooks.json"] = @'
 { "modules": ["./register.tsx"] }
@@ -339,13 +339,37 @@ function sound($: any, name: string) {
 }
 
 // Window title: settitle.exe (built by the installer) sets the title of the
-// Claude Code window, so a screen reader can read the state with its title key.
+// Claude Code window, so a screen reader can read it with its title key.
+// It reads the conversation's name, then what Claude is doing:
+// "Fix the login page - Claude is working".
 let shownTitle = ''
-function title($: any, text: string) {
+let stateText = 'Claude is ready'
+let convTitle = ''
+function title($: any, state?: string) {
+  if (state) stateText = state
+  const text = convTitle ? `${convTitle} - ${stateText}` : stateText
   if (text === shownTitle) return
   shownTitle = text
   try {
     $.process.run([`${$.plugin.root}\\settitle.exe`, text], { timeoutMs: 5000 }).catch(() => {})
+  } catch {}
+  void writeWindowFile($, text)
+}
+
+// The NVDA add-on's Control+F finds this conversation by the window's title:
+// one small file per session, in .claude\claude-accessibility\windows.
+async function writeWindowFile($: any, text: string) {
+  try {
+    const info = await $.session.info()
+    const id = await $.session.id()
+    const path: string = info.transcriptPath
+    const sep = path.includes('\\') ? '\\' : '/'
+    const up = (p: string) => p.slice(0, p.lastIndexOf(sep))
+    const config = up(up(up(path))) // <config>\projects\<folder>\<id>.jsonl
+    await $.fs.write(
+      [config, 'claude-accessibility', 'windows', `${id}.json`].join(sep),
+      JSON.stringify({ title: text, name: convTitle, transcript: path }),
+    )
   } catch {}
 }
 
@@ -384,6 +408,47 @@ function stopWaiting($: any, retitle: boolean) {
   }
 }
 
+// The conversation's name. Claude Code keeps it as the session title, which
+// /rename sets and /resume lists. When a conversation has none, a short name is
+// made from what the person asked (again after the 4th prompt, as the topic
+// settles), shown at once, and saved as the session title with the next prompt.
+let titleIsOwn = false      // set by the person or Claude Code, so never replaced
+let savedTitle = ''         // the last name this mod saved
+let pendingTitle = ''       // made, waiting for the next prompt to be saved
+let prompts: string[] = []  // what the person typed this session
+let naming = false
+function clean(s: string) {
+  return s.replace(/\s+/g, ' ').trim()
+}
+function setConvTitle($: any, t: string) {
+  convTitle = clean(t).slice(0, 80)
+  title($)
+}
+async function makeTitle($: any) {
+  if (naming || titleIsOwn || !prompts.length) return
+  naming = true
+  try {
+    const asked = prompts.slice(0, 6).map((p, i) => `Request ${i + 1}: ${p.slice(0, 1500)}`).join('\n\n')
+    const r: any = await $.model.complete({
+      model: 'haiku',
+      maxTokens: 40,
+      timeoutMs: 20000,
+      prompt:
+        'Name this conversation with Claude, from what the person asked so far. ' +
+        'Write 3 to 7 plain words in sentence case that say what it is about, like "Fix the login page" or "Plan a trip to Rome". ' +
+        'No quotes, no ending punctuation, no emoji. Reply with the name only.\n\n' + asked,
+    })
+    const t = r?.isAnswered ? clean(String(r.text)).replace(/^["'`]+|["'`.]+$/g, '').slice(0, 80) : ''
+    if (t && !titleIsOwn) {
+      pendingTitle = t
+      setConvTitle($, t)
+    }
+  } catch {
+  } finally {
+    naming = false
+  }
+}
+
 // Writing rules Claude reads in every conversation.
 const SCREEN_READER_RULES = [
   'The person using this session is blind and uses a screen reader (such as NVDA or JAWS). Write for listening:',
@@ -403,12 +468,222 @@ const EXTRA_WORDS = [
 let engineWord = ''
 let shownWord = ''
 
+// /resume as plain text a screen reader can read: a numbered list of past
+// conversations, newest first, or the ones that mention every word typed after
+// /resume. "/resume 3" then opens number 3 of the last list.
+type Conv = {
+  id: string
+  path: string
+  mtime: number
+  size: number
+  cwd: string
+  title: string
+  first: string
+  text: string // what the person and Claude wrote, lowercased, for searching
+}
+const convCache = new Map<string, Conv>()
+let lastList: Conv[] = []
+const CHUNK = 4 * 1024 * 1024
+const MAX_TEXT = 400000
+
+function messageText(content: any): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.filter((b: any) => b && b.type === 'text' && typeof b.text === 'string').map((b: any) => b.text).join('\n')
+}
+
+async function scanConv($: any, path: string, id: string, size: number, mtime: number): Promise<Conv> {
+  const c: Conv = { id, path, mtime, size, cwd: '', title: '', first: '', text: '' }
+  let custom = ''
+  let ai = ''
+  const parts: string[] = []
+  let used = 0
+  let carry = ''
+  const take = (line: string) => {
+    if (line.length < 20) return
+    const head = line.slice(0, 400)
+    const isTitle = head.includes('"type":"custom-title"') || head.includes('"type":"ai-title"')
+    const isUser = head.includes('"type":"user"') && head.includes('"isSidechain":false')
+    const isClaude = line.includes('"role":"assistant"') && head.includes('"isSidechain":false')
+    if (!isTitle && !isUser && !isClaude) return
+    let o: any
+    try { o = JSON.parse(line) } catch { return }
+    if (o.type === 'custom-title' && o.customTitle) custom = String(o.customTitle)
+    else if (o.type === 'ai-title' && o.aiTitle) ai = String(o.aiTitle)
+    else if (o.type === 'user' && !o.isMeta && o.message) {
+      if (!c.cwd && o.cwd) c.cwd = String(o.cwd)
+      const t = messageText(o.message.content).trim()
+      if (!t || t.startsWith('<')) return
+      // Short openers ("hi") say little, so take more prompts until there is enough.
+      if (c.first.length < 40) c.first = c.first ? `${c.first}, then: ${clean(t)}` : clean(t)
+      if (used < MAX_TEXT) { parts.push(t); used += t.length }
+    } else if (o.type === 'assistant' && o.message) {
+      const t = messageText(o.message.content).trim()
+      if (t && used < MAX_TEXT) { parts.push(t); used += t.length }
+    }
+  }
+  for (let offset = 0; offset < size; offset += CHUNK) {
+    const piece: string = await $.fs.read(path, { offset, length: CHUNK })
+    const lines = (carry + piece).split('\n')
+    carry = lines.pop() ?? ''
+    for (const line of lines) take(line)
+  }
+  take(carry)
+  c.title = clean(custom || ai)
+  c.text = (c.title + '\n' + parts.join('\n')).toLowerCase()
+  return c
+}
+
+async function allConvs($: any): Promise<Conv[]> {
+  const info = await $.session.info()
+  const me = await $.session.id()
+  const sep = info.transcriptPath.includes('\\') ? '\\' : '/'
+  const projectDir = info.transcriptPath.slice(0, info.transcriptPath.lastIndexOf(sep))
+  const projects = projectDir.slice(0, projectDir.lastIndexOf(sep))
+  const found: Conv[] = []
+  for (const d of await $.fs.list(projects)) {
+    if (d.kind !== 'dir') continue
+    let files: any[] = []
+    try { files = await $.fs.list(projects + sep + d.name) } catch { continue }
+    for (const f of files) {
+      if (f.kind !== 'file' || !f.name.endsWith('.jsonl')) continue
+      const id = f.name.slice(0, -6)
+      if (id === me) continue
+      const path = projects + sep + d.name + sep + f.name
+      let c = convCache.get(path)
+      if (!c || c.size !== f.size || c.mtime !== f.mtimeMs) {
+        try { c = await scanConv($, path, id, f.size, f.mtimeMs) } catch { continue }
+        convCache.set(path, c)
+      }
+      if (c.first || c.title) found.push(c)
+    }
+  }
+  return found.sort((a, b) => b.mtime - a.mtime)
+}
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+function when(ms: number, now: number) {
+  const d = new Date(ms)
+  const day = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()
+  const days = Math.round((day(new Date(now)) - day(d)) / 86400000)
+  const h = d.getHours()
+  const time = `${h % 12 || 12}:${String(d.getMinutes()).padStart(2, '0')} ${h < 12 ? 'AM' : 'PM'}`
+  if (days === 0) return `today at ${time}`
+  if (days === 1) return `yesterday at ${time}`
+  const date = `${MONTHS[d.getMonth()]} ${d.getDate()}`
+  return d.getFullYear() === new Date(now).getFullYear() ? date : `${date}, ${d.getFullYear()}`
+}
+
+// A short piece of text around the first place the first word appears.
+function snippet(c: Conv, word: string) {
+  const i = c.text.indexOf(word)
+  if (i < 0) return ''
+  const start = Math.max(0, i - 60)
+  return clean(c.text.slice(start, i + word.length + 90))
+}
+
+function folderName(cwd: string) {
+  const parts = cwd.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || cwd
+}
+
+const SHOW = 15
+
 export const register: Register = on => {
   on('session.start', ($, e, next) => {
     background.clear()
     shownTitle = ''
     title($, 'Claude is ready')
     return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // A new, cleared or resumed conversation: take its name, if it has one.
+  on('classic.SessionStart', ($, e, next) => {
+    prompts = []
+    pendingTitle = ''
+    savedTitle = ''
+    const t = clean(String((e as any).session_title ?? ''))
+    titleIsOwn = !!t
+    setConvTitle($, t)
+    return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // Each prompt: pick up a name set elsewhere, or save the one this mod made.
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    const t = clean(String((e as any).session_title ?? ''))
+    if (t && t !== savedTitle && t !== convTitle) {
+      titleIsOwn = true
+      pendingTitle = ''
+      setConvTitle($, t)
+    }
+    const r: any = await next(e)
+    if (pendingTitle && !titleIsOwn) {
+      savedTitle = pendingTitle
+      pendingTitle = ''
+      return { ...r, sessionTitle: savedTitle }
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
+  // /rename names the conversation at once.
+  on('command.run', { command: 'rename' }, async ($, e, next) => {
+    const r = await next(e)
+    const t = clean(e.args)
+    if (t) {
+      titleIsOwn = true
+      pendingTitle = ''
+      setConvTitle($, t)
+    }
+    return r
+  }).catch(($, e, next) => next(e))
+
+  on('command.run', { command: 'resume' }, async ($, e, next) => {
+    const args = clean(e.args)
+    // A conversation id, as Claude Code's own /resume takes it.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(args)) return next(e)
+    // A number from the last list.
+    if (/^\d+$/.test(args)) {
+      const c = lastList[Number(args) - 1]
+      if (!c) {
+        return {
+          text: lastList.length
+            ? `There is no number ${args} in the last list. Pick 1 to ${lastList.length}.`
+            : 'Type /resume first to list your conversations, then /resume and a number.',
+          isTextDisplayOnly: true,
+        }
+      }
+      return next({ ...e, args: c.id })
+    }
+    const words = args.toLowerCase().split(' ').filter(Boolean)
+    const now: number = await $.clock.now()
+    const convs = await allConvs($)
+    const hits = words.length ? convs.filter(c => words.every(w => c.text.includes(w))) : convs
+    lastList = hits.slice(0, SHOW)
+    if (!lastList.length) {
+      return {
+        text: words.length ? `No conversations mention ${args}.` : 'You have no other conversations yet.',
+        isTextDisplayOnly: true,
+      }
+    }
+    const here = clean(await $.session.root()).toLowerCase()
+    const lines = [
+      words.length
+        ? `${hits.length} conversation${hits.length === 1 ? '' : 's'} mention ${args}` + (hits.length > SHOW ? `. The newest ${SHOW}:` : ':')
+        : `Your ${lastList.length} newest conversations:`,
+    ]
+    lastList.forEach((c, i) => {
+      const name = c.title || c.first.slice(0, 100)
+      let line = `${i + 1}. ${name}. ${when(c.mtime, now)}`
+      if (c.cwd && c.cwd.toLowerCase() !== here) line += `, in the folder ${folderName(c.cwd)}`
+      line += '.'
+      if (words.length) {
+        const s = snippet(c, words[0] ?? '')
+        if (s) line += ` "...${s}..."`
+      }
+      lines.push(line)
+    })
+    lines.push('Type /resume and a number to open one, such as /resume 1.')
+    return { text: lines.join('\n'), isTextDisplayOnly: true }
   }).catch(($, e, next) => next(e))
 
   on('prompt.compose', async ($, e, next) => {
@@ -422,7 +697,7 @@ export const register: Register = on => {
     const w = e.props.word
     if (w !== engineWord) {
       engineWord = w
-      shownWord = Math.random() < 0.3 ? EXTRA_WORDS[Math.floor(Math.random() * EXTRA_WORDS.length)] : w
+      shownWord = Math.random() < 0.3 ? (EXTRA_WORDS[Math.floor(Math.random() * EXTRA_WORDS.length)] ?? w) : w
     }
     return next({ ...e, props: { ...e.props, word: shownWord } })
   })
@@ -479,6 +754,11 @@ export const register: Register = on => {
       backgroundChanged($)
     } else if (kind === 'composer' || kind === 'bridge') {
       stopWaiting($, false)
+      const typed = clean(String(e.text))
+      if (typed && !typed.startsWith('/')) {
+        prompts.push(typed)
+        if (!titleIsOwn && (prompts.length === 1 || prompts.length === 4)) void makeTitle($)
+      }
     }
     title($, 'Claude is working')
     return next(e)
@@ -561,9 +841,12 @@ export const register: Register = on => {
             $inst = Invoke-Tool $claude @('plugin', 'install', 'quiet-tools@claude-accessibility') 180
             if ($inst.Code -eq 0) {
                 $null = Invoke-Tool $claude @('plugin', 'enable', 'quiet-tools@claude-accessibility') 60
+                # An earlier install recorded an older version; this records the new one.
+                $null = Invoke-Tool $claude @('plugin', 'update', 'quiet-tools@claude-accessibility') 120
                 if ($inst.Out -match 'already installed') { Say 'The quiet-tools mod was already installed. Its files were refreshed.' }
                 else { Say 'The quiet-tools mod was installed. Tool call lines are now hidden; press Ctrl+O to see them.' }
                 Say 'Tip: type /copy in Claude Code to copy its last reply to the clipboard.'
+                Say 'Type /resume to hear your newest conversations, or /resume and some words to search them.'
                 $modReady = $true
             } else {
                 Say 'The quiet-tools mod could not be installed. Claude Code said:'
