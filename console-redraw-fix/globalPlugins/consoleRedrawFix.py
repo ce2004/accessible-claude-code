@@ -9,6 +9,7 @@
 # so Control+F in a Claude Code window asks for text, then opens the whole conversation
 # as a document in browse mode, with the cursor on the most recent place the text appears.
 # The arrow keys read on from there. F3 and Shift+F3 go to the next and previous match.
+# NVDA+Control+L reads Claude's last reply; pressed twice, it opens the reply in browse mode.
 # It finds the conversation through small files the quiet-tools mod writes, one per session,
 # naming the window title and the conversation's transcript file.
 
@@ -25,6 +26,8 @@ import core
 import globalPluginHandler
 import gui
 import queueHandler
+import scriptHandler
+import speech
 import textInfos
 import ui
 import wx
@@ -284,6 +287,49 @@ class ConsoleRedrawFix(LiveText):
 			gesture.send()
 			return
 		wx.CallAfter(self._crfAskFind, conversation)
+
+	@script(
+		description="In a Claude Code window, reads Claude's last reply. Pressed twice, opens it in browse mode",
+		gesture="kb:NVDA+control+l",
+		category=_CATEGORY,
+	)
+	def script_crfLastReply(self, gesture):
+		windowTitle = api.getForegroundObject().name or ""
+		conversation = _findConversation(windowTitle)
+		if conversation is None:
+			gesture.send()
+			return
+		isTwice = scriptHandler.getLastScriptRepeatCount() >= 1
+		threading.Thread(
+			target=self._crfLastReply, args=(conversation, isTwice), daemon=True, name="consoleRedrawFixReply"
+		).start()
+
+	def _crfLastReply(self, conversation: dict, isTwice: bool):
+		try:
+			messages = _readConversation(conversation["transcript"])
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't read the conversation")
+			queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "The conversation could not be read")
+			return
+		replies = [body for who, body in messages if who == "Claude"]
+		if not replies:
+			queueHandler.queueFunction(queueHandler.eventQueue, ui.message, "Claude has not replied yet")
+			return
+		reply = replies[-1]
+		if isTwice:
+			page = "<h1>Claude's last reply</h1>\n" + "\n".join(
+				"<p>" + html.escape(p.strip("\n")).replace("\n", "<br>") + "</p>"
+				for p in reply.split("\n\n")
+				if p.strip()
+			)
+			wx.CallAfter(_showDocument, page, "Claude's last reply")
+		else:
+			queueHandler.queueFunction(queueHandler.eventQueue, self._crfSpeak, reply)
+
+	@staticmethod
+	def _crfSpeak(text: str):
+		speech.cancelSpeech()
+		ui.message(text)
 
 	def _crfAskFind(self, conversation: dict):
 		global _lastFind

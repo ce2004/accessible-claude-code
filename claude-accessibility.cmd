@@ -6,7 +6,7 @@ rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. 
 rem When it starts, it checks GitHub for a newer version, and if there is one it
 rem replaces this file with it and runs it instead.
 rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
-set "CA_VERSION=1.2.1"
+set "CA_VERSION=1.3.0"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%CA_PS%" set "CA_PS="
@@ -308,7 +308,7 @@ if (-not $claude) {
 { "name": "claude-accessibility", "owner": { "name": "Claude Accessibility" }, "plugins": [ { "name": "quiet-tools", "source": "./plugins/quiet-tools", "description": "Hides tool call lines for screen reader users." } ] }
 '@
         $files["$mod\.claude-plugin\plugin.json"] = @'
-{ "name": "quiet-tools", "version": "0.2.1", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
+{ "name": "quiet-tools", "version": "0.3.0", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
 '@
         $files["$mod\hooks\hooks.json"] = @'
 { "modules": ["./register.tsx"] }
@@ -372,6 +372,64 @@ async function writeWindowFile($: any, text: string) {
     )
   } catch {}
 }
+
+// What a tool call does, in words for the window title: Claude is reading
+// register.tsx; Claude wants to run a command: Install packages.
+// Each is a verb, its -ing form, and what it acts on.
+const VERBS: Record<string, [string, string]> = {
+  read: ['read', 'reading'],
+  edit: ['edit', 'editing'],
+  write: ['write', 'writing'],
+  search: ['search', 'searching'],
+  open: ['open', 'opening'],
+  start: ['start', 'starting'],
+  run: ['run', 'running'],
+  use: ['use', 'using'],
+}
+function fileName(p: unknown) {
+  const s = String(p ?? '')
+  const parts = s.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || s
+}
+function host(u: unknown) {
+  const m = String(u ?? '').match(/^[a-z]+:\/\/([^/?#]+)/i)
+  return m?.[1] ? m[1].replace(/^www\./, '') : 'a web page'
+}
+function action(e: any): [keyof typeof VERBS, string] {
+  const t = String(e.tool)
+  switch (t) {
+    case 'Read': return ['read', fileName(e.file_path)]
+    case 'Edit': case 'MultiEdit': case 'NotebookEdit': return ['edit', fileName(e.file_path ?? e.notebook_path)]
+    case 'Write': return ['write', fileName(e.file_path)]
+    case 'Grep': return ['search', e.pattern ? `files for ${String(e.pattern).slice(0, 40)}` : 'files']
+    case 'Glob': return ['search', 'for files']
+    case 'WebSearch': return ['search', e.query ? `the web for ${String(e.query).slice(0, 50)}` : 'the web']
+    case 'WebFetch': return ['open', host(e.url)]
+    case 'Agent': case 'Task': return ['start', e.description ? `a helper to ${String(e.description).slice(0, 50)}` : 'a helper']
+    case 'Bash': case 'PowerShell':
+      return ['run', e.description ? `a command: ${String(e.description).slice(0, 60)}` : 'a command']
+  }
+  if (t.startsWith('mcp__')) return ['use', t.split('__')[1]?.replace(/[_-]+/g, ' ') || 'a connected app']
+  return ['use', t]
+}
+function doing(e: any) {
+  const [v, what] = action(e)
+  return `${e.agentId ? "Claude's helper is" : 'Claude is'} ${VERBS[v]![1]} ${what}`
+}
+function wanting(e: any) {
+  const [v, what] = action(e)
+  return `Claude wants to ${VERBS[v]![0]} ${what}`
+}
+// The newest tool call still running, so a permission prompt can name it.
+let lastCall: any = null
+
+// How full the conversation is, read as each reply ends. A warning shows under
+// a reply when it first passes 80 percent and again past 90; it resets after a
+// /compact brings it back down.
+let contextPercent = 0
+let warnedAt = 0
+let warnText = ''
+const warnings = new Map<number, string>()
 
 // Background work Claude started (commands and helper agents), by tool call id.
 const background = new Set<string>()
@@ -752,6 +810,19 @@ export const register: Register = on => {
 
   // Done sound when Claude finishes a reply (not when a helper agent finishes).
   on('turn.complete', async ($, e, next) => {
+    if (!e.agentId) {
+      warnText = ''
+      try {
+        const u: any = await $.session.usage()
+        contextPercent = Math.round(Number(u?.context?.percent ?? 0))
+      } catch {}
+      if (contextPercent < 70) warnedAt = 0
+      const level = contextPercent >= 90 ? 90 : contextPercent >= 80 ? 80 : 0
+      if (level > warnedAt) {
+        warnedAt = level
+        warnText = ` The conversation is ${contextPercent} percent full. Type /compact to make room, or /clear to start fresh.`
+      }
+    }
     const r = await next(e)
     if (!e.agentId) {
       stopWaiting($, false)
@@ -770,6 +841,11 @@ export const register: Register = on => {
     if (e.tool === 'AskUserQuestion') startWaiting($, 'Claude has a question for you')
     else if (e.tool === 'ExitPlanMode') startWaiting($, 'Claude needs your plan approval')
     const isBackground = (e as any).run_in_background === true
+    const asks = ASKS.has(e.tool)
+    if (!asks) {
+      lastCall = e
+      if (!waiting) title($, doing(e))
+    }
     try {
       const r: any = await next(e)
       if (isBackground && e.tool_use_id && !r?.deny && !r?.isError) {
@@ -778,13 +854,17 @@ export const register: Register = on => {
       }
       return r
     } finally {
+      if (lastCall === e) lastCall = null
+      const wasWaiting = !!waiting
       stopWaiting($, true)
+      if (!wasWaiting && !asks) title($, 'Claude is working')
     }
   }).catch(($, e, next) => next(e))
 
-  // Permission prompts and other dialogs that wait on the person.
+  // Permission prompts and other dialogs that wait on the person. The title
+  // names what Claude wants to do, when a tool call is waiting on it.
   on('classic.Notification', ($, e, next) => {
-    if (e.notification_type === 'permission_prompt') startWaiting($, 'Claude needs your permission')
+    if (e.notification_type === 'permission_prompt') startWaiting($, lastCall ? wanting(lastCall) : 'Claude needs your permission')
     else if (e.notification_type === 'elicitation_dialog') startWaiting($, 'Claude needs your answer')
     return next(e)
   }).catch(($, e, next) => next(e))
@@ -855,7 +935,14 @@ export const register: Register = on => {
     const p = e.props
     if (p.isExpanded || p.waitingFor) return next(e)
     const { Text } = $.ui.resolve(e)
-    return <Text dimColor>{background.size ? 'Done. Still working in the background.' : 'Done.'}</Text>
+    const done = background.size ? 'Done. Still working in the background.' : 'Done.'
+    // The warning belongs to the reply it was found at: the first line drawn
+    // after it, known again by that reply's duration if the screen is redrawn.
+    if (warnText) {
+      warnings.set(p.durationMs, warnText)
+      warnText = ''
+    }
+    return <Text dimColor>{done + (warnings.get(p.durationMs) ?? '')}</Text>
   })
 
   // The mode labels at the right of the prompt footer.
@@ -1290,6 +1377,50 @@ try {
     }
 } catch {
     Say ('The Claude Usage add-on could not be set up: ' + $_.Exception.Message)
+    $failed++
+}
+
+# ---------------------------------------------------------------- Part 6: check that it all took
+# Looks at what is in place now, whatever the steps above reported, so a part that
+# did not take is named here instead of being found later.
+Say ''
+Say 'Checking the setup.'
+$problems = @()
+try {
+    $now = $null
+    if (Test-Path -LiteralPath $settingsPath) { try { $now = (Read-Text $settingsPath) | ConvertFrom-Json } catch {} }
+    if (-not $now -or $now.axScreenReader -ne $true) { $problems += 'Screen reader mode is not on in the Claude Code settings.' }
+} catch { $problems += 'The Claude Code settings could not be checked.' }
+
+if ($claude) {
+    $modDir = Join-Path $dir 'claude-accessibility\plugins\quiet-tools'
+    foreach ($f in @('hooks\register.tsx', 'sounds\done.wav', 'sounds\attention.wav', 'settitle.exe')) {
+        if (-not (Test-Path -LiteralPath (Join-Path $modDir $f))) { $problems += ('A file of the quiet-tools mod is missing: ' + $f + '.') }
+    }
+    try {
+        $list = Invoke-Tool $claude @('plugin', 'list') 120
+        $at = $list.Out.IndexOf('quiet-tools@claude-accessibility')
+        if ($at -lt 0) {
+            $problems += 'Claude Code does not list the quiet-tools mod as installed.'
+        } else {
+            $entry = $list.Out.Substring($at, [Math]::Min(400, $list.Out.Length - $at))
+            $next = $entry.IndexOf([char]10 + '  ' + [char]0x276F)
+            if ($next -gt 0) { $entry = $entry.Substring(0, $next) }
+            if ($entry -notmatch '(?i)\benabled\b' -or $entry -match '(?i)\bdisabled\b') { $problems += 'The quiet-tools mod is installed but not turned on. In a terminal, run: claude plugin enable quiet-tools@claude-accessibility' }
+        }
+    } catch { $problems += 'Claude Code could not be asked which mods it has.' }
+}
+
+if ($nvdaExe -or (Test-Path -LiteralPath $nvdaConfig)) {
+    if (-not (Test-Path -LiteralPath "$addonDir\manifest.ini") -and -not (Test-Path -LiteralPath $addonMark)) { $problems += 'The Console Redraw Fix add-on is not in NVDA.' }
+    if (-not (Test-Path -LiteralPath "$usageDir\manifest.ini") -and -not (Test-Path -LiteralPath $usageMark)) { $problems += 'The Claude Usage add-on is not in NVDA.' }
+}
+
+if ($problems.Count -eq 0) {
+    Say 'Everything is in place.'
+} else {
+    foreach ($p in $problems) { Say $p }
+    Say 'Run this file again to try those parts again.'
     $failed++
 }
 
