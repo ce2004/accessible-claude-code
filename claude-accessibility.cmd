@@ -6,7 +6,7 @@ rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. 
 rem When it starts, it checks GitHub for a newer version, and if there is one it
 rem replaces this file with it and runs it instead.
 rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
-set "CA_VERSION=1.2.0"
+set "CA_VERSION=1.2.1"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%CA_PS%" set "CA_PS="
@@ -308,7 +308,7 @@ if (-not $claude) {
 { "name": "claude-accessibility", "owner": { "name": "Claude Accessibility" }, "plugins": [ { "name": "quiet-tools", "source": "./plugins/quiet-tools", "description": "Hides tool call lines for screen reader users." } ] }
 '@
         $files["$mod\.claude-plugin\plugin.json"] = @'
-{ "name": "quiet-tools", "version": "0.2.0", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
+{ "name": "quiet-tools", "version": "0.2.1", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
 '@
         $files["$mod\hooks\hooks.json"] = @'
 { "modules": ["./register.tsx"] }
@@ -424,19 +424,52 @@ function setConvTitle($: any, t: string) {
   convTitle = clean(t).slice(0, 80)
   title($)
 }
+// What the person asked over the whole conversation, a resumed one included:
+// the first few requests (what it set out to do) and the latest few.
+async function askedSoFar($: any): Promise<string[]> {
+  let asked: string[] = []
+  try {
+    const msgs: any = await $.session.messages()
+    if (Array.isArray(msgs)) {
+      asked = msgs
+        .filter((m: any) => m.role === 'user' && typeof m.text === 'string')
+        .map((m: any) => clean(m.text))
+        .filter((t: string) => t && !t.startsWith('<') && !t.startsWith('/'))
+    }
+  } catch {}
+  for (const p of prompts) if (!asked.includes(p)) asked.push(p)
+  return asked.length > 8 ? [...asked.slice(0, 4), ...asked.slice(-4)] : asked
+}
+
+// Names this mod saved, by session, so a resumed conversation it named can be
+// named again as it grows, while a name the person gave is kept.
+const OWN_KEY = 'own-titles'
+async function ownTitles($: any): Promise<Record<string, string>> {
+  try {
+    const v = await $.store.get(OWN_KEY)
+    return v && typeof v === 'object' ? (v as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+
 async function makeTitle($: any) {
-  if (naming || titleIsOwn || !prompts.length) return
+  if (naming || titleIsOwn) return
   naming = true
   try {
-    const asked = prompts.slice(0, 6).map((p, i) => `Request ${i + 1}: ${p.slice(0, 1500)}`).join('\n\n')
+    const asked = await askedSoFar($)
+    if (!asked.length) return
+    const list = asked.map((p, i) => `Request ${i + 1}: ${p.slice(0, 800)}`).join('\n\n')
     const r: any = await $.model.complete({
       model: 'haiku',
       maxTokens: 40,
       timeoutMs: 20000,
       prompt:
-        'Name this conversation with Claude, from what the person asked so far. ' +
-        'Write 3 to 7 plain words in sentence case that say what it is about, like "Fix the login page" or "Plan a trip to Rome". ' +
-        'No quotes, no ending punctuation, no emoji. Reply with the name only.\n\n' + asked,
+        'Below are the requests a person typed in a conversation with Claude Code, a coding assistant, oldest first. ' +
+        'Name the conversation by its main task or project, the way a person would label it in a list of past conversations. ' +
+        'Weigh the first requests most, since they say what the conversation set out to do; later ones are often follow-ups. ' +
+        'Write 3 to 7 plain words in sentence case, like "Fix the login page" or "Screen reader setup for Claude Code". ' +
+        'No quotes, no ending punctuation, no emoji. Reply with the name only.\n\n' + list,
     })
     const t = r?.isAnswered ? clean(String(r.text)).replace(/^["'`]+|["'`.]+$/g, '').slice(0, 80) : ''
     if (t && !titleIsOwn) {
@@ -598,20 +631,28 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   // A new, cleared or resumed conversation: take its name, if it has one.
-  on('classic.SessionStart', ($, e, next) => {
+  // A resumed conversation with no name, or one this mod named, is named
+  // (again) from all of it right away.
+  on('classic.SessionStart', async ($, e, next) => {
     prompts = []
     pendingTitle = ''
     savedTitle = ''
     const t = clean(String((e as any).session_title ?? ''))
-    titleIsOwn = !!t
+    const own = await ownTitles($)
+    const id = String((e as any).session_id ?? '')
+    const isMine = !!t && own[id] === t
+    titleIsOwn = !!t && !isMine
+    if (isMine) savedTitle = t
     setConvTitle($, t)
-    return next(e)
+    const r = await next(e)
+    if (!titleIsOwn && (e as any).source === 'resume') void makeTitle($)
+    return r
   }).catch(($, e, next) => next(e))
 
   // Each prompt: pick up a name set elsewhere, or save the one this mod made.
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const t = clean(String((e as any).session_title ?? ''))
-    if (t && t !== savedTitle && t !== convTitle) {
+    if (t && t !== savedTitle && t !== convTitle && t !== pendingTitle) {
       titleIsOwn = true
       pendingTitle = ''
       setConvTitle($, t)
@@ -620,6 +661,13 @@ export const register: Register = on => {
     if (pendingTitle && !titleIsOwn) {
       savedTitle = pendingTitle
       pendingTitle = ''
+      try {
+        const own = await ownTitles($)
+        own[String((e as any).session_id ?? '')] = savedTitle
+        const keys = Object.keys(own)
+        for (const k of keys.slice(0, Math.max(0, keys.length - 500))) delete own[k]
+        await $.store.set(OWN_KEY, own)
+      } catch {}
       return { ...r, sessionTitle: savedTitle }
     }
     return r
@@ -757,7 +805,7 @@ export const register: Register = on => {
       const typed = clean(String(e.text))
       if (typed && !typed.startsWith('/')) {
         prompts.push(typed)
-        if (!titleIsOwn && (prompts.length === 1 || prompts.length === 4)) void makeTitle($)
+        if (!titleIsOwn && ((prompts.length === 1 && !convTitle) || prompts.length === 4)) void makeTitle($)
       }
     }
     title($, 'Claude is working')
@@ -953,7 +1001,7 @@ static class SetTitle
             } finally {
                 Remove-Item -LiteralPath $buildDir -Recurse -Force -ErrorAction SilentlyContinue
             }
-            Say 'Window titles are on: the title says when Claude is working, done, or needs you.'
+            Say 'Window titles are on: the title names the conversation and says when Claude is working, done, or needs you.'
         } catch {
             Say ('The mod works, but window titles could not be set up: ' + $_.Exception.Message)
             $failed++
@@ -1151,6 +1199,74 @@ try {
     }
 } catch {
     Say ('The Console Redraw Fix add-on could not be set up: ' + $_.Exception.Message)
+    $failed++
+}
+
+# ---------------------------------------------------------------- Part 5: the Claude Usage add-on for NVDA
+# Lets NVDA say how much of the Claude plan is used. Installed from the newest
+# release on GitHub only when it is not in NVDA yet; a copy already there is left
+# alone, since it updates from NVDA's Add-on Store. If the person removed it after
+# this setup installed it, it is not put back.
+Say ''
+$usageName = 'claudeUsage'
+$usageApi = 'https://api.github.com/repos/ce2004/claude-usage-for-nvda/releases/latest'
+$usageDir = Join-Path $nvdaConfig "addons\$usageName"
+$usageMark = Join-Path $dir 'claude-accessibility\claude-usage-installed.txt'
+try {
+    if (-not $nvdaExe -and -not (Test-Path -LiteralPath $nvdaConfig)) {
+        Say 'NVDA is not installed, so the Claude Usage add-on was skipped. It is only for NVDA.'
+    } elseif (Test-Path -LiteralPath "$usageDir\manifest.ini") {
+        Say 'The Claude Usage add-on is already in NVDA, so it was left as it is.'
+    } elseif (Test-Path -LiteralPath $usageMark) {
+        Say 'The Claude Usage add-on was removed from NVDA earlier, so it was not put back.'
+        Say ('To get it back, delete ' + $usageMark + ', then run this again.')
+    } else {
+        # Find the add-on file in the newest release.
+        try { $release = $enc.GetString((Get-Download $usageApi)) | ConvertFrom-Json }
+        catch { throw 'GitHub could not be reached. Check that you are online, then run this again.' }
+        $asset = @($release.assets | Where-Object { $_.name -like '*.nvda-addon' }) | Select-Object -First 1
+        if (-not $asset) { throw 'the newest release on GitHub has no add-on file' }
+        $stage = Join-Path ([IO.Path]::GetTempPath()) ('claude-accessibility-' + [Guid]::NewGuid().ToString('N'))
+        try {
+            New-Item -ItemType Directory -Path $stage | Out-Null
+            $zip = Join-Path $stage 'addon.zip'
+            try { [IO.File]::WriteAllBytes($zip, (Get-Download $asset.browser_download_url)) }
+            catch { throw 'it could not be downloaded from GitHub. Check that you are online, then run this again.' }
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $unpacked = Join-Path $stage 'addon'
+            [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+            if (-not (Test-Path -LiteralPath "$unpacked\manifest.ini")) { throw 'the downloaded add-on did not look right' }
+            $newText = Read-Text "$unpacked\manifest.ini"
+            if ((Get-ManifestValue $newText 'name') -ne $usageName) { throw 'the downloaded add-on did not look right' }
+            $minNvda = ConvertTo-Version (Get-ManifestValue $newText 'minimumNVDAVersion')
+            $nvdaVersion = $null
+            if ($nvdaExe) { try { $nvdaVersion = ConvertTo-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($nvdaExe).ProductVersion) } catch {} }
+            if ($nvdaVersion -and $minNvda -and $nvdaVersion -lt $minNvda) {
+                Say ('The Claude Usage add-on needs NVDA ' + $minNvda + ' or newer, and this PC has NVDA ' + $nvdaVersion + ', so it was skipped.')
+                Say 'Update NVDA, then run this again.'
+                $failed++
+            } else {
+                $addonsRoot = Split-Path $usageDir
+                if (-not (Test-Path -LiteralPath $addonsRoot)) { New-Item -ItemType Directory -Path $addonsRoot -Force | Out-Null }
+                try {
+                    Copy-Item -LiteralPath $unpacked -Destination $usageDir -Recurse
+                } catch {
+                    if (Test-Path -LiteralPath $usageDir) { Remove-Item -LiteralPath $usageDir -Recurse -Force -ErrorAction SilentlyContinue }
+                    throw
+                }
+                Say ('The Claude Usage add-on for NVDA was installed (version ' + (Get-ManifestValue $newText 'version') + ').')
+                Say 'It says how much of your Claude plan you have used. Give it keys in NVDA under Preferences, Input gestures, Claude Usage.'
+                $nvdaRestart = if ($nvdaRestart) { $nvdaRestart + ' and the Claude Usage add-on' } else { 'to load the Claude Usage add-on' }
+                $markDir = Split-Path $usageMark
+                if (-not (Test-Path -LiteralPath $markDir)) { New-Item -ItemType Directory -Path $markDir -Force | Out-Null }
+                [IO.File]::WriteAllText($usageMark, "The Claude Usage add-on was installed in NVDA. Delete this file to have it put back.`r`n", $enc)
+            }
+        } finally {
+            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    Say ('The Claude Usage add-on could not be set up: ' + $_.Exception.Message)
     $failed++
 }
 
