@@ -2,7 +2,7 @@
 # Some console programs, such as Claude Code, wipe the console and draw everything again.
 # NVDA then sees the whole screen as new, reads it all from the top,
 # and the review cursor lands at the top.
-# This add-on spots those redraws in terminal windows (Windows Terminal and the classic console),
+# This add-on spots those redraws in Claude Code windows (in Windows Terminal or the classic console),
 # speaks only lines you have not heard yet, and puts the review cursor on the last line of text.
 #
 # It also adds Find for Claude Code conversations. The terminal only keeps the last screen or so,
@@ -13,7 +13,10 @@
 # It finds the conversation through small files the quiet-tools mod writes, one per session,
 # naming the window title and the conversation's transcript file.
 #
-# The review cursor stays where you are reading: new text in a terminal does not move it,
+# Everything here works only in Claude Code windows, known by the window titles the quiet-tools
+# mod sets; every other terminal works as if the add-on were not there.
+#
+# The review cursor stays where you are reading: new text in Claude Code does not move it,
 # unless "Move the review cursor to new text" is turned on in NVDA's settings, under
 # Console Redraw Fix. NVDA+A (say all) reads from the review cursor to the end, and
 # pressing Down Arrow puts the review cursor on the last line of text.
@@ -116,6 +119,20 @@ def _windowFiles() -> list[dict]:
 	return sorted(found, key=lambda e: e["mtime"], reverse=True)
 
 
+def _isClaudeTitle(windowTitle: str) -> bool:
+	"""Whether a window title is one the quiet-tools mod sets for Claude Code:
+	what Claude is doing ("Claude is working"), after the conversation's name if it has one."""
+	title = windowTitle or ""
+	return title.startswith("Claude") or " - Claude" in title
+
+
+def _inClaudeWindow() -> bool:
+	try:
+		return _isClaudeTitle(api.getForegroundObject().name)
+	except Exception:
+		return False
+
+
 def _findConversation(windowTitle: str):
 	"""The window file of the Claude Code session drawn in a window with this title, or None."""
 	entries = [e for e in _windowFiles() if os.path.isfile(e["transcript"])]
@@ -123,7 +140,7 @@ def _findConversation(windowTitle: str):
 		if entry.get("title") == windowTitle:
 			return entry
 	# The title can change between the mod writing it and Windows showing it.
-	if "Claude" in (windowTitle or "") and entries:
+	if _isClaudeTitle(windowTitle) and entries:
 		return entries[0]
 	return None
 
@@ -234,6 +251,8 @@ class ConsoleRedrawFix(LiveText):
 
 	def _calculateNewText(self, newText: str, oldText: str) -> list[str]:
 		outLines = super()._calculateNewText(newText, oldText)
+		if not _inClaudeWindow():
+			return outLines
 		self._crfRemember(oldText)
 		try:
 			pieces = []
@@ -303,7 +322,7 @@ class ConsoleRedrawFix(LiveText):
 		# NVDA moves the review cursor to the caret, and in a terminal the caret moves
 		# with every bit of new output. Unless the setting asks for that, keep the
 		# review cursor where the person is reading; braille and the rest still follow.
-		if _movesReview():
+		if _movesReview() or not _inClaudeWindow():
 			return super().event_caret()
 		kept = api.getReviewPosition()
 		super().event_caret()
@@ -314,23 +333,27 @@ class ConsoleRedrawFix(LiveText):
 			log.exception("Console Redraw Fix: couldn't keep the review cursor in place")
 
 	@script(
-		description="Reads from the review cursor to the end of the terminal",
+		description="In a Claude Code window, reads from the review cursor to the end",
 		gestures=["kb:NVDA+a", "kb(desktop):NVDA+downArrow"],
 		category=_CATEGORY,
 	)
 	def script_crfSayAll(self, gesture):
-		if _sayAll is None:
-			gesture.send()
+		if _sayAll is None or not _inClaudeWindow():
+			# Anywhere else, NVDA's own say all.
+			import globalCommands
+			globalCommands.commands.script_sayAll(gesture)
 			return
 		_sayAll.SayAllHandler.readText(_sayAll.CURSOR.REVIEW)
 
 	@script(
-		description="Sends Down Arrow to the program and puts the review cursor on the last line of text",
+		description="In a Claude Code window, sends Down Arrow and puts the review cursor on the last line of text",
 		gesture="kb:downArrow",
 		category=_CATEGORY,
 	)
 	def script_crfDownToEnd(self, gesture):
 		gesture.send()
+		if not _inClaudeWindow():
+			return
 		core.callLater(100, self._crfReviewToEnd)
 
 	def _crfReviewToEnd(self):
@@ -354,7 +377,7 @@ class ConsoleRedrawFix(LiveText):
 	def script_crfFind(self, gesture):
 		windowTitle = api.getForegroundObject().name or ""
 		conversation = _findConversation(windowTitle)
-		if conversation is None:
+		if conversation is None or not _isClaudeTitle(windowTitle):
 			# Not a Claude Code window: the program gets the key as usual.
 			gesture.send()
 			return
@@ -368,7 +391,7 @@ class ConsoleRedrawFix(LiveText):
 	def script_crfLastReply(self, gesture):
 		windowTitle = api.getForegroundObject().name or ""
 		conversation = _findConversation(windowTitle)
-		if conversation is None:
+		if conversation is None or not _isClaudeTitle(windowTitle):
 			gesture.send()
 			return
 		isTwice = scriptHandler.getLastScriptRepeatCount() >= 1
@@ -483,7 +506,7 @@ class ConsoleRedrawFixPanel(settingsDialogs.SettingsPanel):
 	def makeSettings(self, settingsSizer):
 		helper = guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
 		self.moveReview = helper.addItem(
-			wx.CheckBox(self, label="&Move the review cursor to new text in terminal windows")
+			wx.CheckBox(self, label="&Move the review cursor to new text in Claude Code windows")
 		)
 		self.moveReview.SetValue(_movesReview())
 
