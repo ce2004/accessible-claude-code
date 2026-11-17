@@ -23,7 +23,7 @@ If you use NVDA, it installs the Console Redraw Fix add-on. Claude Code sometime
 
 The add-on also adds Find for Claude Code conversations. The terminal only keeps about the last screen of text, so it searches the saved conversation instead. In a Claude Code window, press Control+F (or NVDA+Control+F), type what to find, and press Enter. NVDA opens the whole conversation as a document in browse mode, with a heading for each of your messages and each of Claude's replies, and puts you on the most recent place the text appears. Read on with the arrow keys. Shift+F3 goes to the match before, F3 to the one after, and Escape closes it. In other terminal windows Control+F works as usual. You can change these keys in NVDA's Input gestures, under Console Redraw Fix.
 
-If you use NVDA and do not have it yet, it installs the Claude Usage add-on from its newest release on GitHub. It says how much of your Claude plan you have used: the 5-hour session, the weekly limit and when they reset. It has no keys at first; give it some in NVDA under Preferences, Input gestures, Claude Usage. If you already have it, the setup leaves it alone, since it updates from NVDA's Add-on Store. It needs NVDA 2026.1 or newer.
+If you use NVDA, it installs the Claude Usage add-on from its newest release on GitHub. It says how much of your Claude plan you have used: the 5-hour session, the weekly limit and when they reset. It has no keys at first; give it some in NVDA under Preferences, Input gestures, Claude Usage. If you have it, the setup updates it when GitHub has a newer version. It needs NVDA 2026.1 or newer.
 
 You need
 

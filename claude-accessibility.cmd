@@ -1204,66 +1204,89 @@ try {
 
 # ---------------------------------------------------------------- Part 5: the Claude Usage add-on for NVDA
 # Lets NVDA say how much of the Claude plan is used. Installed from the newest
-# release on GitHub only when it is not in NVDA yet; a copy already there is left
-# alone, since it updates from NVDA's Add-on Store. If the person removed it after
-# this setup installed it, it is not put back.
+# release on GitHub, or updated when that release is newer than the copy in NVDA.
+# If the person removed it after it was set up here, it is not put back.
 Say ''
 $usageName = 'claudeUsage'
 $usageApi = 'https://api.github.com/repos/ce2004/claude-usage-for-nvda/releases/latest'
 $usageDir = Join-Path $nvdaConfig "addons\$usageName"
 $usageMark = Join-Path $dir 'claude-accessibility\claude-usage-installed.txt'
 try {
+    $usageText = if (Test-Path -LiteralPath "$usageDir\manifest.ini") { Read-Text "$usageDir\manifest.ini" } else { $null }
     if (-not $nvdaExe -and -not (Test-Path -LiteralPath $nvdaConfig)) {
         Say 'NVDA is not installed, so the Claude Usage add-on was skipped. It is only for NVDA.'
-    } elseif (Test-Path -LiteralPath "$usageDir\manifest.ini") {
-        Say 'The Claude Usage add-on is already in NVDA, so it was left as it is.'
-    } elseif (Test-Path -LiteralPath $usageMark) {
+    } elseif (-not $usageText -and (Test-Path -LiteralPath $usageMark)) {
         Say 'The Claude Usage add-on was removed from NVDA earlier, so it was not put back.'
         Say ('To get it back, delete ' + $usageMark + ', then run this again.')
     } else {
-        # Find the add-on file in the newest release.
+        # The newest release, and its version from the tag (v1.2.0), so an up to date
+        # copy needs no download.
         try { $release = $enc.GetString((Get-Download $usageApi)) | ConvertFrom-Json }
         catch { throw 'GitHub could not be reached. Check that you are online, then run this again.' }
         $asset = @($release.assets | Where-Object { $_.name -like '*.nvda-addon' }) | Select-Object -First 1
         if (-not $asset) { throw 'the newest release on GitHub has no add-on file' }
-        $stage = Join-Path ([IO.Path]::GetTempPath()) ('claude-accessibility-' + [Guid]::NewGuid().ToString('N'))
-        try {
-            New-Item -ItemType Directory -Path $stage | Out-Null
-            $zip = Join-Path $stage 'addon.zip'
-            try { [IO.File]::WriteAllBytes($zip, (Get-Download $asset.browser_download_url)) }
-            catch { throw 'it could not be downloaded from GitHub. Check that you are online, then run this again.' }
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            $unpacked = Join-Path $stage 'addon'
-            [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
-            if (-not (Test-Path -LiteralPath "$unpacked\manifest.ini")) { throw 'the downloaded add-on did not look right' }
-            $newText = Read-Text "$unpacked\manifest.ini"
-            if ((Get-ManifestValue $newText 'name') -ne $usageName) { throw 'the downloaded add-on did not look right' }
-            $minNvda = ConvertTo-Version (Get-ManifestValue $newText 'minimumNVDAVersion')
-            $nvdaVersion = $null
-            if ($nvdaExe) { try { $nvdaVersion = ConvertTo-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($nvdaExe).ProductVersion) } catch {} }
-            if ($nvdaVersion -and $minNvda -and $nvdaVersion -lt $minNvda) {
-                Say ('The Claude Usage add-on needs NVDA ' + $minNvda + ' or newer, and this PC has NVDA ' + $nvdaVersion + ', so it was skipped.')
-                Say 'Update NVDA, then run this again.'
-                $failed++
-            } else {
-                $addonsRoot = Split-Path $usageDir
-                if (-not (Test-Path -LiteralPath $addonsRoot)) { New-Item -ItemType Directory -Path $addonsRoot -Force | Out-Null }
-                try {
-                    Copy-Item -LiteralPath $unpacked -Destination $usageDir -Recurse
-                } catch {
-                    if (Test-Path -LiteralPath $usageDir) { Remove-Item -LiteralPath $usageDir -Recurse -Force -ErrorAction SilentlyContinue }
-                    throw
+        $oldVersion = if ($usageText) { ConvertTo-Version (Get-ManifestValue $usageText 'version') } else { $null }
+        $tagVersion = ConvertTo-Version ([string]$release.tag_name -replace '^[vV]', '')
+        if ($oldVersion -and $tagVersion -and $oldVersion -ge $tagVersion) {
+            Say ('The Claude Usage add-on for NVDA is already up to date (version ' + $oldVersion + ').')
+        } else {
+            $stage = Join-Path ([IO.Path]::GetTempPath()) ('claude-accessibility-' + [Guid]::NewGuid().ToString('N'))
+            try {
+                New-Item -ItemType Directory -Path $stage | Out-Null
+                $zip = Join-Path $stage 'addon.zip'
+                try { [IO.File]::WriteAllBytes($zip, (Get-Download $asset.browser_download_url)) }
+                catch { throw 'it could not be downloaded from GitHub. Check that you are online, then run this again.' }
+                Add-Type -AssemblyName System.IO.Compression.FileSystem
+                $unpacked = Join-Path $stage 'addon'
+                [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+                if (-not (Test-Path -LiteralPath "$unpacked\manifest.ini")) { throw 'the downloaded add-on did not look right' }
+                $newText = Read-Text "$unpacked\manifest.ini"
+                if ((Get-ManifestValue $newText 'name') -ne $usageName) { throw 'the downloaded add-on did not look right' }
+                $newVersion = ConvertTo-Version (Get-ManifestValue $newText 'version')
+                $minNvda = ConvertTo-Version (Get-ManifestValue $newText 'minimumNVDAVersion')
+                $nvdaVersion = $null
+                if ($nvdaExe) { try { $nvdaVersion = ConvertTo-Version ([Diagnostics.FileVersionInfo]::GetVersionInfo($nvdaExe).ProductVersion) } catch {} }
+                if (-not $newVersion) {
+                    throw 'the downloaded add-on has no version number'
+                } elseif ($oldVersion -and $oldVersion -ge $newVersion) {
+                    Say ('The Claude Usage add-on for NVDA is already up to date (version ' + $oldVersion + ').')
+                } elseif ($nvdaVersion -and $minNvda -and $nvdaVersion -lt $minNvda) {
+                    Say ('The Claude Usage add-on needs NVDA ' + $minNvda + ' or newer, and this PC has NVDA ' + $nvdaVersion + ', so it was skipped.')
+                    Say 'Update NVDA, then run this again.'
+                    $failed++
+                } else {
+                    # Swap the folders, keeping the old one until the new one is in place.
+                    $addonsRoot = Split-Path $usageDir
+                    if (-not (Test-Path -LiteralPath $addonsRoot)) { New-Item -ItemType Directory -Path $addonsRoot -Force | Out-Null }
+                    $old = $usageDir + '.old-claude-accessibility'
+                    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
+                    if (Test-Path -LiteralPath $usageDir) { Move-Item -LiteralPath $usageDir -Destination $old }
+                    try {
+                        Copy-Item -LiteralPath $unpacked -Destination $usageDir -Recurse
+                    } catch {
+                        if (Test-Path -LiteralPath $usageDir) { Remove-Item -LiteralPath $usageDir -Recurse -Force -ErrorAction SilentlyContinue }
+                        if (Test-Path -LiteralPath $old) { Move-Item -LiteralPath $old -Destination $usageDir }
+                        throw
+                    }
+                    if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue }
+                    if ($oldVersion) {
+                        Say ('The Claude Usage add-on for NVDA was updated to version ' + $newVersion + '.')
+                    } else {
+                        Say ('The Claude Usage add-on for NVDA was installed (version ' + $newVersion + ').')
+                        Say 'It says how much of your Claude plan you have used. Give it keys in NVDA under Preferences, Input gestures, Claude Usage.'
+                    }
+                    $nvdaRestart = if ($nvdaRestart) { $nvdaRestart + ' and the Claude Usage add-on' } else { 'to load the Claude Usage add-on' }
                 }
-                Say ('The Claude Usage add-on for NVDA was installed (version ' + (Get-ManifestValue $newText 'version') + ').')
-                Say 'It says how much of your Claude plan you have used. Give it keys in NVDA under Preferences, Input gestures, Claude Usage.'
-                $nvdaRestart = if ($nvdaRestart) { $nvdaRestart + ' and the Claude Usage add-on' } else { 'to load the Claude Usage add-on' }
-                $markDir = Split-Path $usageMark
-                if (-not (Test-Path -LiteralPath $markDir)) { New-Item -ItemType Directory -Path $markDir -Force | Out-Null }
-                [IO.File]::WriteAllText($usageMark, "The Claude Usage add-on was installed in NVDA. Delete this file to have it put back.`r`n", $enc)
+            } finally {
+                Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
             }
-        } finally {
-            Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+    # Remember that it was set up, so removing it in NVDA is respected later.
+    if (Test-Path -LiteralPath "$usageDir\manifest.ini") {
+        $markDir = Split-Path $usageMark
+        if (-not (Test-Path -LiteralPath $markDir)) { New-Item -ItemType Directory -Path $markDir -Force | Out-Null }
+        [IO.File]::WriteAllText($usageMark, "The Claude Usage add-on was installed in NVDA. Delete this file to have it put back.`r`n", $enc)
     }
 } catch {
     Say ('The Claude Usage add-on could not be set up: ' + $_.Exception.Message)
