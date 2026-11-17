@@ -12,6 +12,11 @@
 # NVDA+Control+L reads Claude's last reply; pressed twice, it opens the reply in browse mode.
 # It finds the conversation through small files the quiet-tools mod writes, one per session,
 # naming the window title and the conversation's transcript file.
+#
+# The review cursor stays where you are reading: new text in a terminal does not move it,
+# unless "Move the review cursor to new text" is turned on in NVDA's settings, under
+# Console Redraw Fix. NVDA+A (say all) reads from the review cursor to the end, and
+# pressing Down Arrow puts the review cursor on the last line of text.
 
 import html
 import inspect
@@ -22,6 +27,7 @@ import time
 from collections import OrderedDict
 
 import api
+import config
 import core
 import globalPluginHandler
 import gui
@@ -31,9 +37,28 @@ import speech
 import textInfos
 import ui
 import wx
+from gui import guiHelper, settingsDialogs
 from logHandler import log
 from NVDAObjects.behaviors import LiveText
 from scriptHandler import script
+
+try:
+	from speech import sayAll as _sayAll
+except Exception:
+	_sayAll = None
+
+_CONF = "consoleRedrawFix"
+config.conf.spec[_CONF] = {
+	# Off: new text in a terminal leaves the review cursor where it is.
+	"moveReviewToNewText": "boolean(default=False)",
+}
+
+
+def _movesReview() -> bool:
+	try:
+		return bool(config.conf[_CONF]["moveReviewToNewText"])
+	except Exception:
+		return False
 
 # How many recently seen lines to remember.
 _MAX_SEEN = 4000
@@ -236,7 +261,7 @@ class ConsoleRedrawFix(LiveText):
 
 	def _crfMoveReviewToBottom(self):
 		self._crfReviewTimer = None
-		if api.getFocusObject() is not self:
+		if api.getFocusObject() is not self or not _movesReview():
 			return
 		try:
 			info = self._crfLastLineInfo()
@@ -271,6 +296,53 @@ class ConsoleRedrawFix(LiveText):
 			info.expand(textInfos.UNIT_LINE)
 		info.collapse()
 		return info
+
+	# ---------------------------------------------------------------- Where the review cursor goes
+
+	def event_caret(self):
+		# NVDA moves the review cursor to the caret, and in a terminal the caret moves
+		# with every bit of new output. Unless the setting asks for that, keep the
+		# review cursor where the person is reading; braille and the rest still follow.
+		if _movesReview():
+			return super().event_caret()
+		kept = api.getReviewPosition()
+		super().event_caret()
+		try:
+			if kept is not None and kept.obj is self and api.getReviewPosition() is not kept:
+				api.setReviewPosition(kept, clearNavigatorObject=False)
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't keep the review cursor in place")
+
+	@script(
+		description="Reads from the review cursor to the end of the terminal",
+		gestures=["kb:NVDA+a", "kb(desktop):NVDA+downArrow"],
+		category=_CATEGORY,
+	)
+	def script_crfSayAll(self, gesture):
+		if _sayAll is None:
+			gesture.send()
+			return
+		_sayAll.SayAllHandler.readText(_sayAll.CURSOR.REVIEW)
+
+	@script(
+		description="Sends Down Arrow to the program and puts the review cursor on the last line of text",
+		gesture="kb:downArrow",
+		category=_CATEGORY,
+	)
+	def script_crfDownToEnd(self, gesture):
+		gesture.send()
+		core.callLater(100, self._crfReviewToEnd)
+
+	def _crfReviewToEnd(self):
+		try:
+			info = self._crfLastLineInfo()
+			api.setReviewPosition(info)
+			line = info.copy()
+			line.expand(textInfos.UNIT_LINE)
+			speech.cancelSpeech()
+			ui.message(line.text.strip() or "blank")
+		except Exception:
+			log.exception("Console Redraw Fix: couldn't move the review cursor to the end")
 
 	# ---------------------------------------------------------------- Find
 
@@ -405,7 +477,32 @@ class ConsoleRedrawFix(LiveText):
 			log.exception("Console Redraw Fix: couldn't move to the match")
 
 
+class ConsoleRedrawFixPanel(settingsDialogs.SettingsPanel):
+	title = "Console Redraw Fix"
+
+	def makeSettings(self, settingsSizer):
+		helper = guiHelper.BoxSizerHelper(self, sizer=settingsSizer)
+		self.moveReview = helper.addItem(
+			wx.CheckBox(self, label="&Move the review cursor to new text in terminal windows")
+		)
+		self.moveReview.SetValue(_movesReview())
+
+	def onSave(self):
+		config.conf[_CONF]["moveReviewToNewText"] = self.moveReview.GetValue()
+
+
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
+	def __init__(self):
+		super().__init__()
+		settingsDialogs.NVDASettingsDialog.categoryClasses.append(ConsoleRedrawFixPanel)
+
+	def terminate(self):
+		try:
+			settingsDialogs.NVDASettingsDialog.categoryClasses.remove(ConsoleRedrawFixPanel)
+		except ValueError:
+			pass
+		super().terminate()
+
 	def chooseNVDAObjectOverlayClasses(self, obj, clsList):
 		# Only terminal windows that cmd and PowerShell run in:
 		# Windows Terminal (diffing mode) and the classic console, UIA or legacy.

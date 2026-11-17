@@ -6,7 +6,7 @@ rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. 
 rem When it starts, it checks GitHub for a newer version, and if there is one it
 rem replaces this file with it and runs it instead.
 rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
-set "CA_VERSION=1.3.0"
+set "CA_VERSION=1.3.1"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%CA_PS%" set "CA_PS="
@@ -308,7 +308,7 @@ if (-not $claude) {
 { "name": "claude-accessibility", "owner": { "name": "Claude Accessibility" }, "plugins": [ { "name": "quiet-tools", "source": "./plugins/quiet-tools", "description": "Hides tool call lines for screen reader users." } ] }
 '@
         $files["$mod\.claude-plugin\plugin.json"] = @'
-{ "name": "quiet-tools", "version": "0.3.0", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
+{ "name": "quiet-tools", "version": "0.3.1", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
 '@
         $files["$mod\hooks\hooks.json"] = @'
 { "modules": ["./register.tsx"] }
@@ -466,13 +466,12 @@ function stopWaiting($: any, retitle: boolean) {
   }
 }
 
-// The conversation's name. Claude Code keeps it as the session title, which
-// /rename sets and /resume lists. When a conversation has none, a short name is
-// made from what the person asked (again after the 4th prompt, as the topic
-// settles), shown at once, and saved as the session title with the next prompt.
+// The conversation's name, for the window title. A name set with /rename (or by
+// Claude Code) is used as it is. Otherwise a short name is made from what the
+// person asked (again after the 4th prompt, as the topic settles) and kept in this
+// mod's own store, not as Claude Code's session title, so it shows in the window
+// title and the /resume list but not under the prompt.
 let titleIsOwn = false      // set by the person or Claude Code, so never replaced
-let savedTitle = ''         // the last name this mod saved
-let pendingTitle = ''       // made, waiting for the next prompt to be saved
 let prompts: string[] = []  // what the person typed this session
 let naming = false
 function clean(s: string) {
@@ -499,9 +498,20 @@ async function askedSoFar($: any): Promise<string[]> {
   return asked.length > 8 ? [...asked.slice(0, 4), ...asked.slice(-4)] : asked
 }
 
-// Names this mod saved, by session, so a resumed conversation it named can be
-// named again as it grows, while a name the person gave is kept.
+// Names this mod made, by session id. Earlier versions saved them as the session
+// title too, so a session title found here is known as this mod's, not the person's.
 const OWN_KEY = 'own-titles'
+async function saveName($: any, name: string) {
+  try {
+    const id = String(await $.session.id())
+    const own = await ownTitles($)
+    delete own[id]
+    own[id] = name
+    const keys = Object.keys(own)
+    for (const k of keys.slice(0, Math.max(0, keys.length - 1000))) delete own[k]
+    await $.store.set(OWN_KEY, own)
+  } catch {}
+}
 async function ownTitles($: any): Promise<Record<string, string>> {
   try {
     const v = await $.store.get(OWN_KEY)
@@ -531,8 +541,8 @@ async function makeTitle($: any) {
     })
     const t = r?.isAnswered ? clean(String(r.text)).replace(/^["'`]+|["'`.]+$/g, '').slice(0, 80) : ''
     if (t && !titleIsOwn) {
-      pendingTitle = t
       setConvTitle($, t)
+      await saveName($, t)
     }
   } catch {
   } finally {
@@ -693,42 +703,27 @@ export const register: Register = on => {
   // (again) from all of it right away.
   on('classic.SessionStart', async ($, e, next) => {
     prompts = []
-    pendingTitle = ''
-    savedTitle = ''
     const t = clean(String((e as any).session_title ?? ''))
-    const own = await ownTitles($)
     const id = String((e as any).session_id ?? '')
-    const isMine = !!t && own[id] === t
-    titleIsOwn = !!t && !isMine
-    if (isMine) savedTitle = t
-    setConvTitle($, t)
+    const mine = (await ownTitles($))[id] ?? ''
+    titleIsOwn = !!t && t !== mine
+    setConvTitle($, titleIsOwn ? t : mine)
     const r = await next(e)
-    if (!titleIsOwn && (e as any).source === 'resume') void makeTitle($)
+    if (!titleIsOwn && !mine && (e as any).source === 'resume') void makeTitle($)
     return r
   }).catch(($, e, next) => next(e))
 
-  // Each prompt: pick up a name set elsewhere, or save the one this mod made.
+  // Each prompt: pick up a name the person or Claude Code set since.
   on('classic.UserPromptSubmit', async ($, e, next) => {
     const t = clean(String((e as any).session_title ?? ''))
-    if (t && t !== savedTitle && t !== convTitle && t !== pendingTitle) {
-      titleIsOwn = true
-      pendingTitle = ''
-      setConvTitle($, t)
+    if (t && t !== convTitle) {
+      const mine = (await ownTitles($))[String((e as any).session_id ?? '')] ?? ''
+      if (t !== mine) {
+        titleIsOwn = true
+        setConvTitle($, t)
+      }
     }
-    const r: any = await next(e)
-    if (pendingTitle && !titleIsOwn) {
-      savedTitle = pendingTitle
-      pendingTitle = ''
-      try {
-        const own = await ownTitles($)
-        own[String((e as any).session_id ?? '')] = savedTitle
-        const keys = Object.keys(own)
-        for (const k of keys.slice(0, Math.max(0, keys.length - 500))) delete own[k]
-        await $.store.set(OWN_KEY, own)
-      } catch {}
-      return { ...r, sessionTitle: savedTitle }
-    }
-    return r
+    return next(e)
   }).catch(($, e, next) => next(e))
 
   // /rename names the conversation at once.
@@ -737,7 +732,6 @@ export const register: Register = on => {
     const t = clean(e.args)
     if (t) {
       titleIsOwn = true
-      pendingTitle = ''
       setConvTitle($, t)
     }
     return r
@@ -763,7 +757,13 @@ export const register: Register = on => {
     const words = args.toLowerCase().split(' ').filter(Boolean)
     const now: number = await $.clock.now()
     const convs = await allConvs($)
-    const hits = words.length ? convs.filter(c => words.every(w => c.text.includes(w))) : convs
+    const names = await ownTitles($)
+    const hits = words.length
+      ? convs.filter(c => {
+          const named = (names[c.id] ?? '').toLowerCase()
+          return words.every(w => c.text.includes(w) || named.includes(w))
+        })
+      : convs
     lastList = hits.slice(0, SHOW)
     if (!lastList.length) {
       return {
@@ -778,7 +778,7 @@ export const register: Register = on => {
         : `Your ${lastList.length} newest conversations:`,
     ]
     lastList.forEach((c, i) => {
-      const name = c.title || c.first.slice(0, 100)
+      const name = c.title || names[c.id] || c.first.slice(0, 100)
       let line = `${i + 1}. ${name}. ${when(c.mtime, now)}`
       if (c.cwd && c.cwd.toLowerCase() !== here) line += `, in the folder ${folderName(c.cwd)}`
       line += '.'
