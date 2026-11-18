@@ -6,7 +6,7 @@ rem Windows Terminal bell, and installs the Console Redraw Fix add-on for NVDA. 
 rem When it starts, it checks GitHub for a newer version, and if there is one it
 rem replaces this file with it and runs it instead.
 rem Raise CA_VERSION with every change pushed to GitHub, or copies already out there will not update.
-set "CA_VERSION=1.3.1"
+set "CA_VERSION=1.3.2"
 set "CA_SELF=%~f0"
 set "CA_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%CA_PS%" set "CA_PS="
@@ -308,7 +308,7 @@ if (-not $claude) {
 { "name": "claude-accessibility", "owner": { "name": "Claude Accessibility" }, "plugins": [ { "name": "quiet-tools", "source": "./plugins/quiet-tools", "description": "Hides tool call lines for screen reader users." } ] }
 '@
         $files["$mod\.claude-plugin\plugin.json"] = @'
-{ "name": "quiet-tools", "version": "0.3.1", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
+{ "name": "quiet-tools", "version": "0.3.2", "description": "Screen reader help for Claude Code: hides tool call lines (Ctrl+O shows them), plays sounds, names the window after the conversation, and lists or searches conversations with /resume." }
 '@
         $files["$mod\hooks\hooks.json"] = @'
 { "modules": ["./register.tsx"] }
@@ -584,6 +584,9 @@ type Conv = {
 }
 const convCache = new Map<string, Conv>()
 let lastList: Conv[] = []
+// True right after /resume shows a list, so the next prompt can be just a
+// number ("7") to open that conversation. Any other prompt ends it.
+let picking = false
 const CHUNK = 4 * 1024 * 1024
 const MAX_TEXT = 400000
 
@@ -739,16 +742,18 @@ export const register: Register = on => {
 
   on('command.run', { command: 'resume' }, async ($, e, next) => {
     const args = clean(e.args)
+    picking = false
     // A conversation id, as Claude Code's own /resume takes it.
     if (/^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(args)) return next(e)
     // A number from the last list.
     if (/^\d+$/.test(args)) {
       const c = lastList[Number(args) - 1]
       if (!c) {
+        picking = lastList.length > 0
         return {
           text: lastList.length
             ? `There is no number ${args} in the last list. Pick 1 to ${lastList.length}.`
-            : 'Type /resume first to list your conversations, then /resume and a number.',
+            : 'Type /resume first to list your conversations, then type a number.',
           isTextDisplayOnly: true,
         }
       }
@@ -788,7 +793,8 @@ export const register: Register = on => {
       }
       lines.push(line)
     })
-    lines.push('Type /resume and a number to open one, such as /resume 1.')
+    lines.push('Type a number and press Enter to open one, such as 1.')
+    picking = true
     return { text: lines.join('\n'), isTextDisplayOnly: true }
   }).catch(($, e, next) => next(e))
 
@@ -876,6 +882,29 @@ export const register: Register = on => {
   // Something new to do: the person typed, or a background job reported back.
   on('prompt.submit', ($, e, next) => {
     const kind = (e as any).origin?.kind
+    // Right after a /resume list, a prompt that is only a number opens that
+    // conversation instead of going to Claude.
+    if ((kind === 'composer' || kind === 'bridge') && !e.command && !e.isMeta) {
+      const wasPicking = picking
+      picking = false
+      const n = clean(String(e.text)).replace(/^#/, '').replace(/\.$/, '')
+      if (wasPicking && /^\d+$/.test(n)) {
+        const c = lastList[Number(n) - 1]
+        if (!c) {
+          picking = true
+          try { $.ui.toast(`There is no number ${n} in the list. Pick 1 to ${lastList.length}.`) } catch {}
+          return { drop: `no number ${n} in the /resume list` }
+        }
+        let started = false
+        try {
+          $.clock.after(0, () => {
+            $.command.run({ command: 'resume', args: c.id }).catch(() => {})
+          })
+          started = true
+        } catch {}
+        if (started) return { drop: `opening conversation ${n} from the /resume list` }
+      }
+    }
     if (kind === 'task-notification') {
       const ids = String(e.text).match(/<tool-use-id>([^<]+)<\/tool-use-id>/g) || []
       for (const m of ids) background.delete(m.replace(/<\/?tool-use-id>/g, '').trim())
